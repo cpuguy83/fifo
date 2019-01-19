@@ -37,6 +37,10 @@ type fifo struct {
 	closingOnce sync.Once // close has been called
 	closedOnce  sync.Once // fifo is closed
 	handle      *handle
+
+	// in ReadFrom and WriteTo, do not do raw copy
+	forceUserCopy bool
+	noRawFallback bool
 }
 
 var leakCheckWg *sync.WaitGroup

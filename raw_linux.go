@@ -62,7 +62,13 @@ func (f *fifo) rawReadFrom(r io.Reader) (int64, error) {
 		return userCopy(f, r)
 	}
 
-	return rawCopy(wrc, rrc, copyN)
+	n, err := rawCopy(wrc, rrc, copyN)
+	if err != nil {
+		if strings.Contains(err.Error(), "use of closed file") {
+			return n, nil
+		}
+	}
+	return n, err
 }
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
@@ -73,36 +79,6 @@ func getBuffer() []byte {
 
 func putBuffer(buf []byte) {
 	bufPool.Put(buf)
-}
-
-func userCopy(dst io.Writer, src io.Reader) (written int64, err error) {
-	buf := getBuffer()
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-
-	putBuffer(buf)
-	return written, err
 }
 
 func (f *fifo) rawWriteTo(w io.Writer) (int64, error) {
@@ -144,151 +120,85 @@ func (f *fifo) rawWriteTo(w io.Writer) (int64, error) {
 	return n, err
 }
 
-func rawCopy(w syscall.RawConn, r syscall.RawConn, remain int64) (copied int64, retErr error) {
+func rawCopy(w syscall.RawConn, r syscall.RawConn, remain int64) (int64, error) {
 	var (
-		// send fd's from read/write methods
-		chRfd = make(chan uintptr)
-		chWfd = make(chan uintptr)
-
-		// syncronizes both the read/write gorotines with the actual copy loop
-		chErr = make(chan error, 2)
-
-		// store errors from splice call
-		copyErr error
+		wErr, rErr, copyErr error
+		copied              int64
 	)
 
-	// These goroutines call the pipes' `Read` and `Write` methods which run
-	// the passed in function (handler) when the file descriptor is ready for read or write,
-	// respectively..
+	// When the passed in handler functions are called this signals that the
+	// file descriptor is ready.
 	//
-	// The handlers send the fd (which is stable for the entire handler call) to
-	// the loop which runs splice(2).
-	// From there the handlers wait for the call to splice(2) to finish and determine
-	// how to proceed based on the error sent back.
+	// `syscall.Splice` will return `EAGAIN` when either side is no longer ready.
+	// e.g. if the write pipe is full or the read pipe is empty.
+	// When this happens we'll need to wait for them to be ready again.
+	// Normally we would just return `false` in the read/write, but we don't know
+	// which fd is not ready and since these are nested we can't trigger the
+	// read side to wait to be ready without breaking out of the write.
 	//
-	// The handlers should return true only when we are done with reads or writes.
+	// Remember, when the Read/Write handlers return `false`, this does *not*
+	// cause the calls to Read/Write to return, but rather wait for the file to
+	// be ready, at which time the handler will be called again.
+	// Only when the handlers return `true` does this trigger Read/Write to return.
 	//
-	// The error passed back to the goroutines from splice should never be nil.
-	// (otherwise we'd have just looped again to do another splice(2))
-	//
-	// The error will be `EAGAIN` whhen a pipe is no longer ready (e.g. pipe
-	// full), in which case the handler will return false, from there the raw
-	// conn will sleep until the pipe is ready again, and then the function
-	// will be run again.
-	// There is no way for us to know which fd gave us the EAGIN, so we assume
-	// that we need to wait for both fd's.
-	//
-	// Any other error is a fatal error and we should stop everything.
-	//
-	// *Note*: when either pipe is closed, we will get an error from Go's internal/poll package.
-	// This error is not something we can handle (because it is internal to Go).
-	// This is a known issue and will not be fixed upstream.
-	go func() {
-		err := w.Write(func(fd uintptr) bool {
-			select {
-			case chWfd <- fd:
-			case err := <-chErr:
-				return remain == 0 || (err != nil && err != syscall.EAGAIN)
+	// Any other error than `EAGAIN` is a fatal error. `EAGAIN` means we need to
+	// wait for the files to be ready, this is the only case where we will return
+	// false, and only in the `Read` handler since these calls are nested.
+	rErr = r.Read(func(rfd uintptr) bool {
+		wErr = w.Write(func(wfd uintptr) bool {
+			var n int64
+			for remain > 0 && copyErr == nil {
+				n, copyErr = syscall.Splice(int(rfd), nil, int(wfd), nil, int(remain), spliceMove|spliceNonblock)
+				if n > 0 {
+					copied += n
+					remain -= n
+				}
 			}
-
-			err := <-chErr // wait for splice loop to finish
-			return remain == 0 || (err != nil && err != syscall.EAGAIN)
+			return copyErr != nil || remain == 0
 		})
-		if err != nil {
-			err = errors.Wrap(err, "write error")
-		}
-		chErr <- err
-	}()
+		return remain == 0 || (copyErr != nil && copyErr != syscall.EAGAIN)
+	})
 
-	go func() {
-		err := r.Read(func(fd uintptr) bool {
-			select {
-			case chRfd <- fd:
-			case err := <-chErr:
-				return remain == 0 || (err != nil && err != syscall.EAGAIN)
-			}
+	if wErr != nil {
+		return copied, errors.Wrap(wErr, "write error")
+	}
+	if rErr != nil {
+		return copied, errors.Wrap(rErr, "read error")
+	}
+	if copyErr != nil && copyErr != syscall.EAGAIN {
+		return copied, errors.Wrap(copyErr, "splice error")
+	}
 
-			err := <-chErr // wait for splice loop to finish
-			return remain == 0 || (err != nil && err != syscall.EAGAIN)
-		})
-		if err != nil {
-			err = errors.Wrap(err, "read error")
-		}
-		chErr <- err
-	}()
+	return copied, nil
+}
 
-	var wfd, rfd uintptr
-	defer func() {
-		chErr <- retErr
-		chErr <- retErr
-	}()
+func userCopy(dst io.Writer, src io.Reader) (written int64, err error) {
+	buf := getBuffer()
 
 	for {
-		if remain == 0 {
-			break
-		}
-		// wait for read/write fd's.
-		select {
-		case wfd = <-chWfd:
-		case rfd = <-chRfd:
-		case err := <-chErr:
-			return copied, err
-		}
-		select {
-		case wfd = <-chWfd:
-		case rfd = <-chRfd:
-		case err := <-chErr:
-			return copied, err
-		}
-
-		var (
-			err error
-			n   int64
-		)
-		// inner loop lets us call splice over and over on the same fd's until we
-		// get an error.
-		for {
-			select {
-			case err := <-chErr:
-				chErr <- err
-				chErr <- err
-				return copied, err
-			default:
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
 			}
-
-			n, err = syscall.Splice(int(rfd), nil, int(wfd), nil, int(remain), spliceMove|spliceNonblock)
-			copied += n
-			remain -= n
-			if err != nil || remain == 0 {
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
 				break
 			}
 		}
-
-		// signal goroutines that splice is finished
-		// This error should never be nil
-		chErr <- err
-		chErr <- err
-
-		// EAGAIN just means one of our fd's is not ready anymore and we need to
-		// let the poller wait until they are ready again.
-		// Any other error is fatal.
-		//
-		// We'll need to wait for new fd's after EAGAIN due to the interface guarentees
-		// from syscall.RawConn
-		if err != syscall.EAGAIN {
-			copyErr = err
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
 			break
 		}
 	}
 
-	if copyErr != nil {
-		return copied, copyErr
-	}
-	if err := <-chErr; err != nil {
-		return copied, err
-	}
-	if err := <-chErr; err != nil {
-		return copied, err
-	}
-	return copied, nil
+	putBuffer(buf)
+	return written, err
 }
